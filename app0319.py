@@ -30,7 +30,7 @@ COMMON_MODIFIERS = [
 ]
 
 # 타겟에 없으면 ref에도 없어야 / 타겟에 있으면 ref에도 있어야
-STRICT_KEYWORDS = ['실손', '태아', '갱신', '간편', '암', '연금', '저축', '재물']
+STRICT_KEYWORDS = ['실손', '태아', '갱신', '간편', '암', '연금', '저축', '재물', '치매', '정기']
 
 
 # ──────────────────────────────────────────────
@@ -100,38 +100,86 @@ def remove_common_terms(text):
         text = text.replace(term, '')
     return text
 
-def extract_core_name(text):
-    """수식어 제거 → 고유명만 추출"""
+def remove_modifiers(text):
+    """
+    COMMON_MODIFIERS 제거 — 긴 것부터 제거해야 중복 방지.
+    단, STRICT_KEYWORDS와 겹치는 항목은 제거하지 않음.
+    예) "간편가입H3종신" → "H3종신"
+        "간편H3종신"    → "H3종신"  (간편은 STRICT이지만 "간편가입"으로 묶이면 제거)
+    """
     if not text:
         return text
     result = text
-    for mod in COMMON_MODIFIERS:
+    for mod in sorted(COMMON_MODIFIERS, key=len, reverse=True):
+        # STRICT_KEYWORDS 단독 항목은 건드리지 않음
+        # 단, "간편가입"처럼 STRICT 키워드를 포함하는 더 긴 수식어는 제거
+        is_exact_strict = mod in STRICT_KEYWORDS
+        if is_exact_strict:
+            continue
         result = result.replace(mod, '')
     return result
+
+def extract_core_name(text):
+    """수식어 제거 → 고유명만 추출 (점수 계산용)"""
+    return remove_modifiers(text) if text else text
+
+def extract_main_name(text):
+    """
+    괄호 앞 메인 상품명 추출.
+    STRICT 키워드 체크용 — 수식어는 제거하되 STRICT_KEYWORDS 자체는 유지.
+
+    예) "(무)슬기로운 건강생활보험(22.01)(1종경증간편고지Ⅰ형)"
+     →  괄호 앞: "슬기로운건강생활보험"  ("간편" 없음 ✅)
+
+    예) "간편 H3종신(무)"
+     →  괄호 앞: "간편H3종신"  ("간편" 있음 → ref에도 간편 있어야 ✅)
+
+    예) "플러스정기보험"
+     →  "플러스" 제거(COMMON_MODIFIERS) → "정기보험"  ("정기" 있음 ✅)
+    """
+    if not text:
+        return text
+    s = re.sub(r'^[\(\[\(（][무無][\)\]\)）]\s*', '', text.strip())
+    m = re.search(r'[\(\[（\[]', s)
+    if m:
+        s = s[:m.start()]
+    # 수식어 제거 (STRICT_KEYWORDS는 remove_modifiers 내에서 보존됨)
+    return remove_modifiers(clean_text(s))
+
+
+def preprocess_text(text, insurer, exclusion_set, keep_exclusions=True):
+    """
+    공통 전처리.
+    정제 순서:
+    1. 공백/보이지않는문자 제거
+    2. 보험사명 제거
+    3. 무배당·괄호 등 공통 접두어 제거
+    4. COMMON_MODIFIERS 제거 (STRICT_KEYWORDS 제외)
+    5. 특수문자 제거
+    6. 제외문구 제거 (선택)
+    """
+    if not text:
+        return ''
+    result = clean_text(text)
+    result = remove_insurer_name(result, insurer)
+    result = remove_common_terms(result)
+    result = remove_modifiers(result)
+    result = remove_special_chars(result)
+    if not keep_exclusions:
+        result = remove_exclusion_terms(result, exclusion_set)
+    return result
+
 
 def tokenize(text):
     """
     2~4글자 n-gram 토큰으로 분리.
-    예) "더경증간편건강" → {"더경", "경증", "증간", "간편", "편건", "건강",
-                            "더경증", "경증간", ...}
-    상품명처럼 붙여쓰는 한국어에서 의미 단위를 n-gram으로 근사.
+    예) "더경증간편건강" → {"더경", "경증", "증간", "간편", "편건", "건강", ...}
     """
     tokens = set()
     for n in (2, 3, 4):
         for i in range(len(text) - n + 1):
             tokens.add(text[i:i+n])
     return tokens
-
-def preprocess_text(text, insurer, exclusion_set, keep_exclusions=True):
-    if not text:
-        return ''
-    result = clean_text(text)
-    result = remove_insurer_name(result, insurer)
-    result = remove_common_terms(result)
-    result = remove_special_chars(result)
-    if not keep_exclusions:
-        result = remove_exclusion_terms(result, exclusion_set)
-    return result
 
 
 # ──────────────────────────────────────────────
@@ -279,20 +327,25 @@ def calc_match_score(target_clean, ref_clean, target_tokens, ref_tokens, idf):
 
 def extract_main_name(text):
     """
-    괄호 앞 메인 상품명만 추출.
+    괄호 앞 메인 상품명 추출 + 수식어 제거.
+    STRICT 키워드 체크용 — ref의 clean_no_excl(수식어 제거됨)과 공평하게 비교.
+
     예) "(무)슬기로운 건강생활보험(22.01)(1종경증간편고지Ⅰ형)"
-     →  "슬기로운 건강생활보험"
-    괄호 안 부가설명(고지방식·종류·연도 등)은 제외.
+     →  괄호 앞: "슬기로운 건강생활보험"
+     →  수식어 제거 후: "슬기로운건강생활보험"  ("간편" 없음 ✅)
+
+    예) "간편 H3종신(무)"
+     →  괄호 앞: "간편 H3종신"
+     →  수식어 제거 후: "H3종신"  ("간편" 없음 → ref에 간편 없어도 매칭 허용 ✅)
     """
     if not text:
         return text
-    # (무), [무] 등 맨 앞 괄호 제거
     s = re.sub(r'^[\(\[\(（][무無][\)\]\)）]\s*', '', text.strip())
-    # 첫 번째 여는 괄호 앞까지만 사용
     m = re.search(r'[\(\[（\[]', s)
     if m:
         s = s[:m.start()]
-    return s.strip()
+    # 수식어 제거 후 반환 (ref clean_no_excl과 동일 기준)
+    return remove_modifiers(clean_text(s))
 
 # ──────────────────────────────────────────────
 # STRICT 키워드 필터
@@ -784,7 +837,7 @@ def main():
             "1. 보험사명 완전 일치 범위 내에서만 검색\n"
             "2. 보험사상품코드 직접 매칭\n"
             "3. STRICT 키워드 필터\n"
-            "   실손·태아·갱신·간편·암·연금·저축·재물\n"
+            "   실손·태아·갱신·간편·암·연금·저축·재물·치매·정기\n"
             "   타겟 기준 엄격 적용 (한쪽에만 있으면 제외)\n"
             "4. **TF-IDF × 40** (희귀 고유명 토큰 우선)\n"
             "   + token_set_ratio × 0.3\n"
