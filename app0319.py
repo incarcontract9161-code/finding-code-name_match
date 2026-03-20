@@ -13,19 +13,58 @@ st.set_page_config(page_title="⚡ Ultra-Fast Product Matcher", page_icon="🎯"
 # 상수
 # ══════════════════════════════════════════════════════════
 
-DEFAULT_EXCLUSIONS = ['프로미라이프', '통합', '보장', '건강', '보험']
+DEFAULT_EXCLUSIONS = ['프로미라이프', '통합', '보장', '건강', '보험', '가입', '종합']
 
-# STRICT_KEYWORDS : 타겟에 있으면 ref에도 있어야, 타겟에 없으면 ref에도 없어야
-# ※ COMMON_MODIFIERS와 겹치지 않도록 완전히 분리
-STRICT_KEYWORDS = frozenset([
-    '실손', '태아', '갱신', '간편', '암', '연금', '저축', '재물',
-    '치매', '정기', '간병', '경영', '변액', '종신'
+# ══════════════════════════════════════════════════════════
+# 보종(상품 성격) 정의
+# 매칭 파이프라인: 보험사 → 코드 → 보종 → 고유명
+# ══════════════════════════════════════════════════════════
+
+# HARD_STRICT: 양방향 절대 규칙 — 완화 없음
+# 상품 끝에 붙는 보종 키워드 중심 (종신보험, 암보험, 실손보험 등)
+HARD_STRICT = frozenset([
+    '실손', '태아', '암', '연금', '저축', '재물',
+    '경영', '변액', '치아', '여성',
 ])
 
-# COMMON_MODIFIERS : 수식어 제거용 — STRICT_KEYWORDS 항목은 절대 포함하지 않음
-# 긴 것이 앞에 있어야 "간편가입" 제거 후 "간편"이 남는 문제를 방지
+# SOFT_STRICT: 한 방향 절대 + 반대 방향 완화
+# 가입 방식/형태 수식어 — 해당 버전이 없는 보험사 존재 가능
+SOFT_STRICT = frozenset([
+    '갱신', '간편', '정기',
+])
+
+STRICT_KEYWORDS = HARD_STRICT | SOFT_STRICT
+
+# ── 동의어 그룹 ──────────────────────────────────────────
+# 같은 그룹 = 같은 보종으로 간주 → 서로 매칭 허용
+# 그룹 전체가 HARD 규칙 적용 (그룹 있음↔있음, 없음↔없음)
+SYNONYM_GROUPS = [
+    # 운전/교통
+    frozenset(['운전자', '교통']),
+    # 해지환급금 계열 — prefix 매칭 사용
+    # '해약환급금미지급', '해약환급금일부지급', '해지환급금미지급' 등 모든 변형 포함
+    frozenset(['무해지', '저해지', '해약환급금', '해지환급금']),
+    # 상조/장례
+    frozenset(['상조', '장례']),
+    # 어린이/아이
+    frozenset(['어린이', '아이']),
+    # 간병/치매
+    frozenset(['간병', '치매']),
+    # 통합/종합
+    frozenset(['통합', '종합']),
+    # 종신/상속
+    frozenset(['종신', '상속']),
+]
+
+# prefix 매칭: 이 단어로 시작하는 텍스트가 있으면 그룹 소속으로 간주
+# 예) '해약환급금미지급', '해약환급금일부지급' → '해약환급금' 그룹
+_SYNONYM_PREFIX = frozenset(['해약환급금', '해지환급금'])
+
+_SYNONYM_MEMBERS = frozenset(w for grp in SYNONYM_GROUPS for w in grp)
+
+# COMMON_MODIFIERS: 수식어 제거용 — STRICT/동의어 멤버 절대 포함 금지
 COMMON_MODIFIERS = [
-    '심사', '가입',          # "간편" 포함 복합어 — 단독 "간편"보다 먼저 처리
+    '심사', '가입',
     '갱신형', '비갱신형',
     '연만기', '연납', '월납', '일시납',
     '만기', '특약', '기본형', '표준형',
@@ -34,7 +73,6 @@ COMMON_MODIFIERS = [
     '슬림', '베이직', '스마트', '프리미엄',
     '골드', '실버', '블루', '그린',
 ]
-# 정렬은 build 시 한 번만 수행
 _MODIFIERS_SORTED = sorted(COMMON_MODIFIERS, key=len, reverse=True)
 
 
@@ -71,12 +109,29 @@ def remove_insurer_name(text, insurer):
             result = result.replace(partial, '')
     return result
 
+# 정규식 사전 컴파일 (매 호출마다 컴파일 방지)
+_RE_MU_PREFIX    = re.compile(r'^[\(\[\（\(][무無][\)\]\）\)]\s*')
+_RE_PAREN_INNER  = re.compile(r'\([^\)]*\)')
+_RE_BRACKET_OPEN = re.compile(r'[\(\（]')
+
 def remove_brackets_prefix(text):
-    """맨 앞 (무)/[무] 제거 + 전체 괄호 내용 정리"""
+    """
+    괄호 기호 및 내부 구분자 제거 — 내용은 보존.
+
+    - 소괄호 () : 내용 통째로 제거 (부가설명)
+    - 대괄호 [] : 기호만 제거, 내용 보존 ([약:속] → 약속)
+    - 콜론·쉼표 등 구분자 → 공백
+    """
     if not text:
         return ''
-    for term in ['무배당', '(무)', '[무]', '(無)', '배당', '()', '(', ')', '[', ']']:
+    text = _RE_PAREN_INNER.sub('', text)
+    text = text.replace('[', ' ').replace(']', ' ')
+    for ch in (':', ',', '.', '/'):
+        text = text.replace(ch, ' ')
+    for term in ('무배당', '(무)', '(無)', '배당'):
         text = text.replace(term, '')
+    for ch in ('(', ')', '（', '）'):
+        text = text.replace(ch, '')
     return text
 
 def remove_modifiers(text):
@@ -138,23 +193,63 @@ def preprocess_text(text, insurer, exclusion_set, keep_exclusions=True):
         r = remove_exclusion_terms(r, exclusion_set)
     return r
 
-def extract_main_name(original_text):
-    """
-    STRICT 키워드 체크용 메인 상품명 추출.
-    괄호 앞까지만 + COMMON_MODIFIERS 제거 + STRICT_KEYWORDS 보존.
 
-    예) "(무)슬기로운건강생활보험(22.01)(1종경증간편고지Ⅰ형)" → "슬기로운건강생활보험"
-    예) "간편H3종신(무)"   → "간편H3종신"  ("간편" 보존 ✅)
-    예) "플러스정기보험"   → "정기보험"    ("정기" 보존 ✅)
-    예) "간편가입H3종신"   → "H3종신"      ("간편가입" 제거, "간편" 단독 없음 ✅)
+def extract_unique_name(clean_text_str, exclusion_set):
     """
+    2단계: 정제된 텍스트에서 고유명만 추출.
+
+    STRICT_KEYWORDS + 동의어 멤버 + 제외문구를 모두 제거하면
+    남는 텍스트가 진짜 고유 식별자.
+
+    예) "더경증간편건강"  → "더경증"
+        "마음든든암갱신"  → "마음든든"
+        "약속종신"        → "약속"
+        "참편한"          → "참편한"  (제외문구 건강·보험 제거 후)
+    """
+    if not clean_text_str:
+        return ''
+    r = clean_text_str
+    # STRICT_KEYWORDS 제거
+    for kw in STRICT_KEYWORDS:
+        r = r.replace(kw, '')
+    # 동의어 멤버 제거 (STRICT에 없는 것만)
+    for w in _SYNONYM_MEMBERS:
+        if w not in STRICT_KEYWORDS:
+            r = r.replace(w, '')
+    # 제외문구 제거
+    r = remove_exclusion_terms(r, exclusion_set)
+    return r.strip()
+
+def extract_main_name(original_text):
+    """STRICT 키워드 체크용 메인 상품명 추출."""
     if not original_text:
         return ''
-    s = re.sub(r'^[\(\[\(（][무無][\)\]\)）]\s*', '', original_text.strip())
-    m = re.search(r'[\(\[（\[]', s)
+    s = _RE_MU_PREFIX.sub('', original_text.strip())
+    m = _RE_BRACKET_OPEN.search(s)
     if m:
         s = s[:m.start()]
+    s = s.replace('[', ' ').replace(']', ' ')
+    for ch in (':', ',', '.', '/'):
+        s = s.replace(ch, ' ')
     return remove_modifiers(clean_text(s))
+
+
+def _has_group(text, grp):
+    """
+    그룹 소속 여부 판단.
+    - 일반 멤버: 텍스트에 포함되면 True
+    - prefix 멤버: 텍스트에 해당 prefix로 시작하는 단어가 있으면 True
+      예) '해약환급금' prefix → '해약환급금미지급', '해약환급금일부지급' 모두 해당
+    """
+    for w in grp:
+        if w in _SYNONYM_PREFIX:
+            # prefix 매칭: 해당 prefix를 포함하는지 체크
+            if w in text:
+                return True
+        else:
+            if w in text:
+                return True
+    return False
 
 
 # ══════════════════════════════════════════════════════════
@@ -163,29 +258,72 @@ def extract_main_name(original_text):
 
 def filter_by_strict_keywords(target_original, ref_products):
     """
-    Hard rule  : 타겟 메인명에 없는 키워드가 ref에 있으면 무조건 제외 (완화 없음)
-    Soft rule  : 타겟 메인명에 있는 키워드가 ref에 없으면 제외 (후보 없을 때만 완화)
+    HARD_STRICT : 양방향 절대 규칙
+    SOFT_STRICT : 단방향 절대 + 역방향 완화
+    SYNONYM_GROUPS : 그룹 단위 매칭
+      예) 타겟에 '운전자' → ref에 '교통'도 허용 (같은 그룹)
+          타겟에 '무해지' → ref에 '저해지', '해약환급금미지급' 허용
+          타겟에 그룹 없음 → ref에 그룹 단어 있으면 제외
     """
     target_main = extract_main_name(target_original)
 
-    def passes_hard(ref_raw):
-        for kw in STRICT_KEYWORDS:
+    target_synonym_groups = [
+        grp for grp in SYNONYM_GROUPS
+        if _has_group(target_main, grp)
+    ]
+
+    def passes_hard_strict(ref_raw):
+        for kw in HARD_STRICT:
+            if kw in _SYNONYM_MEMBERS: continue
+            t_has = kw in target_main
+            r_has = kw in ref_raw
+            if t_has != r_has:
+                return False
+        for grp in SYNONYM_GROUPS:
+            t_has_grp = _has_group(target_main, grp)
+            r_has_grp = _has_group(ref_raw, grp)
+            if t_has_grp != r_has_grp:
+                return False
+        return True
+
+    hard = [p for p in ref_products if passes_hard_strict(p['clean_no_excl'])]
+
+    if not hard:
+        def passes_hard_absent_only(ref_raw):
+            for kw in HARD_STRICT:
+                if kw in _SYNONYM_MEMBERS: continue
+                if kw not in target_main and kw in ref_raw:
+                    return False
+            for grp in SYNONYM_GROUPS:
+                t_has_grp = _has_group(target_main, grp)
+                r_has_grp = _has_group(ref_raw, grp)
+                if not t_has_grp and r_has_grp:
+                    return False
+            return True
+        hard = [p for p in ref_products if passes_hard_absent_only(p['clean_no_excl'])]
+        if not hard:
+            hard = ref_products
+
+    # SOFT_STRICT absent (타겟에 없는데 ref에 있으면 제외)
+    def passes_soft_absent(ref_raw):
+        for kw in SOFT_STRICT:
             if kw not in target_main and kw in ref_raw:
                 return False
         return True
 
-    hard = [p for p in ref_products if passes_hard(p['clean_no_excl'])]
-    if not hard:
-        return ref_products  # 보험사 전체가 특정 상품군뿐인 엣지케이스
+    candidates = [p for p in hard if passes_soft_absent(p['clean_no_excl'])]
+    if not candidates:
+        candidates = hard
 
-    def passes_soft(ref_raw):
-        for kw in STRICT_KEYWORDS:
+    # SOFT_STRICT present (타겟에 있는데 ref에 없으면 제외, 완화 가능)
+    def passes_soft_present(ref_raw):
+        for kw in SOFT_STRICT:
             if kw in target_main and kw not in ref_raw:
                 return False
         return True
 
-    soft = [p for p in hard if passes_soft(p['clean_no_excl'])]
-    return soft if soft else hard
+    final = [p for p in candidates if passes_soft_present(p['clean_no_excl'])]
+    return final if final else candidates
 
 
 # ══════════════════════════════════════════════════════════
@@ -249,79 +387,71 @@ def count_prefix_match(s1, s2):
             break
     return count
 
-def calc_match_score(target_clean, ref_clean, t_tokens, r_tokens, idf, is_active=False):
+def calc_match_score(t_unique, r_unique, t_unique_tok, r_unique_tok,
+                     t_full, r_full, idf, is_active=False):
     """
-    종합 매칭 점수.
+    점수 계산 — LCS 제외 (승자에게만 1회 계산).
 
-    A. TF-IDF 코사인 유사도 × 40  — 희귀 고유명 토큰 우선
-    B. token_set_ratio      × 0.30 — 어순 무관 유사도
-    C. partial_ratio        × 0.20 — 부분 포함(축약형)
-    D. prefix_match         × 1.50 — 앞부분 일치
-    E. core_sub             × 2.00 — 수식어 제거 후 고유명 연속일치
-    F. 판매중 보너스        + 5.00 — 동일 품질이면 판매중 우선
-       (판매중지가 이기려면 core_sub 2.5글자 이상 더 일치해야 역전 가능)
+    고유명 기준:
+      A. TF-IDF × 40   — 희귀 고유명 n-gram 일치
+      B. prefix × 2    — 고유명 앞부분 일치
+
+    전체 텍스트 기준:
+      C. token_set_ratio × 0.20
+      D. partial_ratio   × 0.15
+
+    판매중 보너스: +5.0
     """
-    if not target_clean or not ref_clean:
-        return 0.0, 0, 0
+    if not t_unique and not t_full:
+        return 0.0, 0
 
-    tfidf  = tfidf_similarity(t_tokens, r_tokens, idf)
-    t_text = keep_text_only(target_clean)
-    r_text = keep_text_only(ref_clean)
-    t_set  = fuzz.token_set_ratio(t_text, r_text)
-    part   = fuzz.partial_ratio(t_text, r_text)
-    prefix = count_prefix_match(t_text, r_text)
-    _, core_sub = find_longest_substring(t_text, r_text)
+    tfidf  = tfidf_similarity(t_unique_tok, r_unique_tok, idf)
+    prefix = count_prefix_match(t_unique, r_unique)
+    t_set  = fuzz.token_set_ratio(t_full, r_full)
+    part   = fuzz.partial_ratio(t_full, r_full)
     active_bonus = 5.0 if is_active else 0.0
 
-    score = (tfidf * 40
-             + t_set * 0.30
-             + part * 0.20
-             + prefix * 1.5
-             + core_sub * 2.0
+    score = (tfidf  * 40
+             + prefix * 2
+             + t_set  * 0.20
+             + part   * 0.15
              + active_bonus)
-    return score, prefix, core_sub
+
+    return score, prefix
 
 
 # ══════════════════════════════════════════════════════════
 # 후보 탐색
 # ══════════════════════════════════════════════════════════
 
-def find_best_in_products(target_clean, ref_products, idf):
-    t_tokens = tokenize(keep_text_only(target_clean))
-    t_text   = keep_text_only(target_clean)
-
+def find_best_in_products(t_unique, t_unique_tok, t_full, ref_products, idf):
+    """
+    점수로 승자 결정 → 승자에게만 LCS 1회 계산.
+    """
     best_match, best_score = None, -1
-    best_prefix = best_core = best_lcs = 0
+    best_prefix = 0
     matched_text = ''
 
     for ref in ref_products:
         is_active = ref['sales_status'] == '판매중'
-        score, prefix, core = calc_match_score(
-            target_clean, ref['clean_no_excl'], t_tokens, ref['tokens'], idf, is_active)
+        score, prefix = calc_match_score(
+            t_unique, ref['unique_name'],
+            t_unique_tok, ref['tokens'],
+            t_full, ref['text_only'],
+            idf, is_active
+        )
         if score > best_score:
             best_score   = score
             best_prefix  = prefix
-            best_core    = core
             best_match   = ref
             matched_text = ref['clean_no_excl']
-            _, best_lcs  = find_longest_substring(t_text, keep_text_only(ref['clean_no_excl']))
 
-    return best_match, best_score, best_prefix, best_core, best_lcs, matched_text
+    # LCS는 승자에게만 1회
+    best_lcs = 0
+    if best_match:
+        _, best_lcs = find_longest_substring(t_unique, best_match['unique_name'])
 
-def best_lcs_all_versions(target_clean, ref, exclusion_set):
-    """4가지 버전 조합 중 가장 긴 LCS 반환"""
-    t_ne = remove_exclusion_terms(target_clean, exclusion_set)
-    versions = [
-        (keep_text_only(target_clean), keep_text_only(ref['clean_no_excl'])),
-        (keep_text_only(target_clean), keep_text_only(ref['clean_with_excl'])),
-        (keep_text_only(t_ne),         keep_text_only(ref['clean_no_excl'])),
-        (keep_text_only(t_ne),         keep_text_only(ref['clean_with_excl'])),
-    ]
-    best = 0
-    for t, r in versions:
-        _, lcs = find_longest_substring(t, r)
-        best = max(best, lcs)
-    return best
+    return best_match, best_score, best_prefix, best_lcs, matched_text
 
 
 # ══════════════════════════════════════════════════════════
@@ -333,79 +463,77 @@ def match_product(target_original, target_clean, ref_products,
     if not ref_products:
         return None, None, 0, 0, '', '', 'No Products'
 
-    # 1. 실손 필터
+    # 1단계: 실손 필터
     if target_is_real:
         filtered = [p for p in ref_products if p['is_real_expense']]
         if filtered:
             ref_products = filtered
 
-    # 2. STRICT 키워드 필터
+    # 1단계: 상품군 분류 (STRICT + 동의어 필터)
     candidates = filter_by_strict_keywords(target_original, ref_products)
 
-    # 3. 1차 매칭 (원본 기준)
-    best, best_score, best_prefix, best_core, best_lcs, matched_text = \
-        find_best_in_products(target_clean, candidates, idf)
+    # 2단계: 고유명 추출 (STRICT+동의어+제외문구 제거)
+    t_unique     = extract_unique_name(target_clean, exclusion_set)
+    t_unique_tok = tokenize(t_unique)
+    t_full       = keep_text_only(target_clean)  # 전체 텍스트 (fuzzy용)
 
-    # 4. TF-IDF 약한 매칭 → 제외문구 제거 버전으로 재시도
-    t_tok = tokenize(keep_text_only(target_clean))
-    tfidf_best = tfidf_similarity(t_tok, best['tokens'] if best else set(), idf)
+    # 3단계: 고유명 기반 최종 매칭
+    best, best_score, best_prefix, best_lcs, matched_text = \
+        find_best_in_products(t_unique, t_unique_tok, t_full, candidates, idf)
 
-    if tfidf_best < 0.15:
-        t_ne     = remove_exclusion_terms(target_clean, exclusion_set)
-        t_ne_tok = tokenize(keep_text_only(t_ne))
-        t_ne_txt = keep_text_only(t_ne)
+    # 약한 매칭(TF-IDF < 0.1) → 제외문구 제거 버전으로 재시도
+    tfidf_best = tfidf_similarity(t_unique_tok, best['tokens'] if best else set(), idf)
+
+    if tfidf_best < 0.1:
+        t_ne         = remove_exclusion_terms(target_clean, exclusion_set)
+        t_ne_unique  = extract_unique_name(t_ne, set())
+        t_ne_tok     = tokenize(t_ne_unique)
+        t_ne_full    = keep_text_only(t_ne)
 
         b2_match, b2_score = None, -1
-        b2_prefix = b2_core = b2_lcs = 0
+        b2_prefix = b2_lcs = 0
         b2_text = ''
 
         for ref in candidates:
             is_active = ref['sales_status'] == '판매중'
-            score2, p2, c2 = calc_match_score(
-                t_ne, ref['clean_with_excl'], t_ne_tok, ref['tokens_no_excl'], idf, is_active)
+            score2, p2 = calc_match_score(
+                t_ne_unique, ref['unique_name'],
+                t_ne_tok, ref['tokens'],
+                t_ne_full, ref['text_only_excl'],
+                idf, is_active
+            )
             if score2 > b2_score:
                 b2_score  = score2
                 b2_prefix = p2
-                b2_core   = c2
                 b2_match  = ref
                 b2_text   = ref['clean_with_excl']
-                _, b2_lcs = find_longest_substring(t_ne_txt, keep_text_only(ref['clean_with_excl']))
 
-        if b2_match and b2_score > best_score:
-            best, best_score = b2_match, b2_score
-            best_prefix, best_core, best_lcs = b2_prefix, b2_core, b2_lcs
-            matched_text = b2_text
+        # 2패스 승자 LCS 1회
+        if b2_match:
+            _, b2_lcs = find_longest_substring(t_ne_unique, b2_match['unique_name'])
+            if b2_score > best_score:
+                best, best_score = b2_match, b2_score
+                best_prefix, best_lcs = b2_prefix, b2_lcs
+                matched_text = b2_text
 
     if not best:
         return None, None, 0, 0, '', '', 'No Match'
 
-    # 5. LCS = 0 → 모든 버전 조합으로 최선 탐색
+    # LCS = 0 → 제외문구 제거 버전으로 재계산
     if best_lcs == 0:
-        fb_match, fb_lcs, fb_text = best, 0, matched_text
-        for ref in candidates:
-            lcs = best_lcs_all_versions(target_clean, ref, exclusion_set)
-            if lcs > fb_lcs:
-                fb_lcs   = lcs
-                fb_match = ref
-                t_ne = keep_text_only(remove_exclusion_terms(target_clean, exclusion_set))
-                best_v, best_v_lcs = ref['clean_no_excl'], 0
-                for tv, rv in [
-                    (keep_text_only(target_clean), ref['clean_no_excl']),
-                    (keep_text_only(target_clean), ref['clean_with_excl']),
-                    (t_ne, ref['clean_no_excl']),
-                    (t_ne, ref['clean_with_excl']),
-                ]:
-                    _, v_lcs = find_longest_substring(tv, keep_text_only(rv))
-                    if v_lcs > best_v_lcs:
-                        best_v_lcs = v_lcs
-                        best_v     = rv
-                fb_text = best_v
-        best, best_lcs, matched_text = fb_match, fb_lcs, fb_text
+        t_ne_u = extract_unique_name(
+            remove_exclusion_terms(target_clean, exclusion_set), set())
+        if t_ne_u:
+            _, lcs = find_longest_substring(t_ne_u, best['unique_name'])
+            if lcs > best_lcs:
+                best_lcs     = lcs
+                matched_text = best['clean_with_excl']
 
     t_tok2  = set(target_clean)
     r_tok2  = set(best['clean_no_excl'])
     overlap = len(t_tok2 & r_tok2)
-    clean_used = f'score={best_score:.2f} lcs={best_lcs} prefix={best_prefix} core={best_core}'
+    clean_used = (f'score={best_score:.2f} unique="{t_unique}" '
+                  f'lcs={best_lcs} prefix={best_prefix}')
 
     return (best['prod_code'], best['prod_name'],
             overlap, best_lcs, matched_text, clean_used, best['sales_status'])
@@ -434,16 +562,24 @@ def build_reference_index(ref_df, exclusion_tuple):
         no_excl   = preprocess_text(prod_name, insurer, exclusion_set, keep_exclusions=True)
         with_excl = preprocess_text(prod_name, insurer, exclusion_set, keep_exclusions=False)
 
+        # 고유명 추출 (STRICT+동의어+제외문구 제거 후 남은 것)
+        unique_name      = extract_unique_name(no_excl, exclusion_set)
+        unique_name_text = keep_text_only(unique_name)
+
         ref_dict[insurer].append({
-            'prod_name':       prod_name,
-            'prod_code':       prod_code,
-            'insurer_code':    ins_code,
-            'clean_no_excl':   no_excl,
-            'clean_with_excl': with_excl,
-            'tokens':          tokenize(keep_text_only(no_excl)),
-            'tokens_no_excl':  tokenize(keep_text_only(with_excl)),
-            'sales_status':    sales_stat,
-            'is_real_expense': is_real,
+            'prod_name':        prod_name,
+            'prod_code':        prod_code,
+            'insurer_code':     ins_code,
+            'clean_no_excl':    no_excl,
+            'clean_with_excl':  with_excl,
+            'text_only':        keep_text_only(no_excl),
+            'text_only_excl':   keep_text_only(with_excl),
+            'unique_name':      unique_name_text,           # 고유명만
+            'tokens':           tokenize(unique_name_text), # TF-IDF는 고유명 기준
+            'tokens_full':      tokenize(keep_text_only(no_excl)),  # 전체 텍스트 토큰
+            'tokens_no_excl':   tokenize(keep_text_only(with_excl)),
+            'sales_status':     sales_stat,
+            'is_real_expense':  is_real,
         })
 
     for insurer in ref_dict:
@@ -452,7 +588,8 @@ def build_reference_index(ref_df, exclusion_tuple):
             -int(''.join(filter(str.isdigit, x['prod_code'])) or 0)
         ))
 
-    idf_dict = {ins: build_tfidf_weights([p['clean_no_excl'] for p in prods])
+    # TF-IDF는 고유명 기준으로 빌드 — 희귀한 고유명일수록 높은 가중치
+    idf_dict = {ins: build_tfidf_weights([p['unique_name'] for p in prods])
                 for ins, prods in ref_dict.items()}
 
     normalized_map = {normalize_insurer(k): k for k in ref_dict}
@@ -495,7 +632,8 @@ def process_target_row(row, ref_dict, idf_dict, normalized_map, exclusion_set, t
             'idx': idx, '상품코드': '', 'Matched_상품명': '', 'Matched_보험사': '',
             'Insurer_Score': 0, 'Overlap_Count': 0, 'Substring_Length': 0,
             'Matched_Text': '', 'Clean_Version': '', 'Match_Method': 'No Insurer Match',
-            'Confidence': 'No Data', '판매상태': 'N/A', 'Target_Clean_Text': ''
+            'Confidence': 'No Data', '판매상태': 'N/A',
+            'Target_Clean_Text': '', 'Target_Original': target_product
         }
 
     ref_products = ref_dict.get(matched_ins, [])
@@ -513,7 +651,8 @@ def process_target_row(row, ref_dict, idf_dict, normalized_map, exclusion_set, t
                     'Match_Method': 'Insurer Code Match', 'Confidence': 'High',
                     '판매상태': ref['sales_status'],
                     'Target_Clean_Text': preprocess_text(
-                        target_product, target_insurer, exclusion_set, keep_exclusions=True)
+                        target_product, target_insurer, exclusion_set, keep_exclusions=True),
+                    'Target_Original': target_product
                 }
 
     target_clean = preprocess_text(target_product, target_insurer, exclusion_set, keep_exclusions=True)
@@ -529,20 +668,108 @@ def process_target_row(row, ref_dict, idf_dict, normalized_map, exclusion_set, t
             'Overlap_Count': overlap, 'Substring_Length': sublen,
             'Matched_Text': matched_text, 'Clean_Version': clean_ver,
             'Match_Method': 'Text Match', 'Confidence': confidence,
-            '판매상태': sales_stat, 'Target_Clean_Text': target_clean
+            '판매상태': sales_stat, 'Target_Clean_Text': target_clean,
+            'Target_Original': target_product
         }
 
     return {
         'idx': idx, '상품코드': '', 'Matched_상품명': '', 'Matched_보험사': matched_ins,
         'Insurer_Score': ins_score, 'Overlap_Count': 0, 'Substring_Length': 0,
         'Matched_Text': '', 'Clean_Version': '', 'Match_Method': 'No Match',
-        'Confidence': 'No Data', '판매상태': 'N/A', 'Target_Clean_Text': target_clean
+        'Confidence': 'No Data', '판매상태': 'N/A',
+        'Target_Clean_Text': target_clean, 'Target_Original': target_product
     }
 
 
-# ══════════════════════════════════════════════════════════
-# 템플릿
-# ══════════════════════════════════════════════════════════
+def cross_match_low_results(results, exclusion_set):
+    """
+    2차 비교: Low/NoMatch → 같은 보험사 High 결과와 텍스트 유사도 비교.
+    보종 일치 확인 후 비교 (변액연금↔종신 같은 오매칭 방지).
+    """
+    HIGH_MIN_LCS    = 5
+    CROSS_MIN_RATIO = 75
+
+    # 보험사별 High 풀 구성 — 보종 판단용 원본 상품명도 저장
+    high_pool = defaultdict(list)
+    for r in results:
+        if (r.get('Confidence') == 'High'
+                and r.get('Substring_Length', 0) >= HIGH_MIN_LCS
+                and r.get('상품코드', '')
+                and r.get('Target_Clean_Text', '')
+                and r.get('Matched_보험사', '')):
+            t_orig = r.get('Target_Original', '')
+            high_pool[r['Matched_보험사']].append({
+                'clean':          keep_text_only(r['Target_Clean_Text']),
+                'target_original': t_orig,
+                'target_main':    extract_main_name(t_orig) if t_orig else '',  # 미리 계산
+                'prod_code':      r['상품코드'],
+                'prod_name':      r.get('Matched_상품명', ''),
+                'sales_status':   r.get('판매상태', ''),
+            })
+
+    if not high_pool:
+        return results, 0
+
+    updated = 0
+    for r in results:
+        if r.get('Confidence') not in ('Low', 'No Data'):
+            continue
+        insurer = r.get('Matched_보험사', '')
+        if not insurer or insurer not in high_pool:
+            continue
+        t_text     = keep_text_only(r.get('Target_Clean_Text', ''))
+        t_original = r.get('Target_Original', '')
+        t_main     = extract_main_name(t_original) if t_original else ''  # Low 타겟 1회만 계산
+        if not t_text:
+            continue
+
+        best_ratio, best_ref = 0, None
+        for h in high_pool[insurer]:
+            if not h['clean']:
+                continue
+            # 보종 필터: 미리 계산된 main_name 사용
+            if not _same_product_group_mains(t_main, h['target_main']):
+                continue
+            ratio = fuzz.partial_ratio(t_text, h['clean'])
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_ref   = h
+                if ratio == 100:
+                    break
+
+        if best_ratio >= CROSS_MIN_RATIO and best_ref:
+            r['상품코드']         = best_ref['prod_code']
+            r['Matched_상품명']   = best_ref['prod_name']
+            r['판매상태']         = best_ref['sales_status']
+            r['Match_Method']     = 'Cross Match (High→Low)'
+            r['Confidence']       = 'Medium'
+            r['Substring_Length'] = best_ratio
+            r['Clean_Version']    = f'cross_ratio={best_ratio}'
+            r['Matched_Text']     = best_ref['prod_name']
+            updated += 1
+
+    return results, updated
+
+
+def _same_product_group_mains(main_a, main_b):
+    """
+    미리 계산된 main_name 두 개로 보종 일치 여부 판단.
+    extract_main_name 반복 호출 없음.
+    """
+    if not main_a or not main_b:
+        return True
+    for kw in HARD_STRICT:
+        if kw in _SYNONYM_MEMBERS:
+            continue
+        if (kw in main_a) != (kw in main_b):
+            return False
+    for grp in SYNONYM_GROUPS:
+        if _has_group(main_a, grp) != _has_group(main_b, grp):
+            return False
+    for kw in SOFT_STRICT:
+        if (kw in main_a) != (kw in main_b):
+            return False
+    return True
 
 def create_target_template():
     return pd.DataFrame({
@@ -649,16 +876,26 @@ def main():
             "💡 매칭 로직\n"
             "1. 보험사명 완전 일치 범위 내에서만 검색\n"
             "2. 보험사상품코드 직접 매칭\n"
-            "3. STRICT 키워드 필터\n"
-            "   실손·태아·갱신·간편·암·연금·저축·재물\n"
-            "   치매·정기·간병·경영·변액·종신\n"
-            "   (타겟 메인명 기준 — 괄호 안 부가설명 제외)\n"
-            "4. TF-IDF×40 + token_set_ratio×0.3\n"
-            "   + partial_ratio×0.2 + prefix×1.5 + core_sub×2\n"
-            "   + **판매중 보너스+5** (판매중 우선 보장)\n"
-            "5. TF-IDF<0.15 → 제외문구 제거 재시도\n"
-            "6. LCS=0 → 전체 버전 조합 재시도\n"
-            "7. 판매중 우선 / 상품코드 높은 순"
+            "3. 보종 필터 (상품 성격 매칭)\n"
+            "   [절대] 실손·태아·암·연금·저축·재물·경영·변액·치아·여성\n"
+            "   [완화] 갱신·간편·정기\n"
+            "   [동의어] 운전자↔교통 / 무해지↔저해지↔해약환급금미지급\n"
+            "   　　　　상조↔장례 / 어린이↔아이 / 간병↔치매\n"
+            "   　　　　통합↔종합 / 종신↔상속\n"
+            "4. [1단계] 상품군 분류\n"
+            "   STRICT+동의어로 후보 풀 확정\n"
+            "   [2단계] 고유명 추출\n"
+            "   STRICT·동의어·제외문구 제거 → 순수 고유명\n"
+            "   [3단계] 고유명 매칭\n"
+            "   TF-IDF×40 + LCS×3 + prefix×2\n"
+            "   + token_set×0.2 + partial×0.15\n"
+            "   + 판매중 보너스+5\n"
+            "5. TF-IDF<0.1 → 제외문구 제거 재시도\n"
+            "6. LCS=0 → 제외문구 제거 버전 재계산\n"
+            "7. **2차 교차매칭**: Low/NoMatch →\n"
+            "   같은 보험사 High 결과와 텍스트 비교\n"
+            "   LCS≥4 이면 해당 상품코드 부여\n"
+            "8. 판매중 우선 / 상품코드 높은 순"
         )
 
     st.error("⚠️ 타겟과 레퍼런스의 **보험사명이 정확히 일치**해야 합니다.")
@@ -697,67 +934,91 @@ def main():
                 progress_bar.progress((idx + 1) / total_rows)
         progress_bar.progress(1.0)
 
+        # 2차 비교: Low/NoMatch → High 결과와 텍스트 유사도 비교
+        results, cross_updated = cross_match_low_results(results, set(exclusion_terms))
+
         df_result = pd.DataFrame(results)
+        df_result = df_result.set_index('idx')
+
         df_output = df_target.copy()
         for col in ['상품코드','Matched_상품명','Matched_보험사','Match_Method',
                     'Overlap_Count','Substring_Length','Confidence','판매상태',
                     'Matched_Text','Clean_Version','Target_Clean_Text']:
-            df_output[col] = df_result[col]
+            if col in df_result.columns:
+                df_output[col] = df_result[col].values
+
+        # 검토필요 컬럼 — 벡터 연산으로 빠르게 처리
+        method  = df_output['Match_Method'].astype(str)
+        conf    = df_output['Confidence'].astype(str)
+        sublen  = pd.to_numeric(df_output['Substring_Length'], errors='coerce').fillna(0).astype(int)
+
+        cond_unmatch = method.isin(['No Match', 'No Insurer Match']) | (conf == 'No Data')
+        cond_review  = (conf == 'Low') | (method == 'Cross Match (High→Low)') | ((conf == 'Medium') & (sublen < 4))
+
+        df_output['검토필요'] = ''
+        df_output.loc[cond_review,  '검토필요'] = '🔍 수기검증필수'
+        df_output.loc[cond_unmatch, '검토필요'] = '⚠️ 미매칭'
+
+        review_cnt = (df_output['검토필요'] != '').sum()
 
         elapsed  = time.time() - start_time
         total    = len(df_output)
         matched  = df_output['상품코드'].astype(str).str.strip().ne('').sum()
         code_m   = (df_output['Match_Method'] == 'Insurer Code Match').sum()
         text_m   = (df_output['Match_Method'] == 'Text Match').sum()
+        cross_m  = (df_output['Match_Method'] == 'Cross Match (High→Low)').sum()
         active   = (df_output['판매상태'] == '판매중').sum()
         disc     = (df_output['판매상태'] == '판매중지').sum()
 
-        st.success(f"✅ {elapsed:.1f}s 완료 | {matched}/{total} 매칭 ({matched/total*100:.1f}%)")
+        st.success(f"✅ {elapsed:.1f}s | {matched}/{total} 매칭 ({matched/total*100:.1f}%)")
 
         no_ins = df_output[df_output['Match_Method'] == 'No Insurer Match']
         if len(no_ins) > 0:
             unmatched = no_ins['보험사'].unique().tolist()
-            st.error(
-                f"❌ 보험사명 불일치 미매칭: {len(no_ins)}건\n\n"
-                f"해당 보험사: `{'`, `'.join(unmatched)}`\n\n"
-                "레퍼런스 파일의 보험사명과 정확히 일치하는지 확인해주세요."
-            )
+            st.error(f"❌ 보험사명 불일치: {len(no_ins)}건 — `{'`, `'.join(unmatched)}`")
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
         c1.metric("⏱️ 시간",       f"{elapsed:.1f}s")
         c2.metric("🔑 코드매칭",   f"{code_m}")
         c3.metric("📝 텍스트매칭", f"{text_m}")
-        c4.metric("🟢 판매중",     f"{active}")
-        c5.metric("🔴 판매중지",   f"{disc}")
+        c4.metric("🔗 교차매칭",   f"{cross_m}")
+        c5.metric("🟢 판매중",     f"{active}")
+        c6.metric("🔴 판매중지",   f"{disc}")
+        c7.metric("🔍 검토필요",   f"{review_cnt}")
 
         st.subheader("📋 결과")
-        st.dataframe(df_output[['보험사','상품명','Target_Clean_Text','Matched_상품명',
+        st.dataframe(df_output[['검토필요','보험사','상품명','Target_Clean_Text','Matched_상품명',
                                  '상품코드','판매상태','Match_Method',
                                  'Substring_Length','Confidence','Clean_Version']].head(50))
 
         st.subheader("🔍 상세 비교 (상위 20건)")
-        for i in range(min(20, len(df_output))):
-            row = df_output.iloc[i]
-            with st.container():
-                st.divider()
-                ca, cb = st.columns(2)
-                with ca:
-                    st.write("**📌 Target:**")
-                    st.info(f"**보험사:** {row['보험사']}\n\n"
-                            f"**상품명:** {row['상품명']}\n\n"
-                            f"**정제:** `{row['Target_Clean_Text']}`")
-                with cb:
-                    if row['상품코드']:
-                        emoji = "🟢" if row['판매상태'] == '판매중' else "🔴"
-                        st.write(f"**{emoji} 매칭 결과:**")
-                        st.success(f"**코드:** `{row['상품코드']}`\n\n"
-                                   f"**상품명:** {row['Matched_상품명']}\n\n"
-                                   f"**매칭텍스트:** `{row['Matched_Text']}`\n\n"
-                                   f"**상태:** {row['판매상태']}")
-                        st.caption(row['Clean_Version'])
-                    else:
-                        st.error("**❌ 미매칭**")
+        try:
+            for i in range(min(20, len(df_output))):
+                row = df_output.iloc[i]
+                with st.container():
+                    st.divider()
+                    ca, cb = st.columns(2)
+                    with ca:
+                        st.write("**📌 Target:**")
+                        st.info(f"**보험사:** {row['보험사']}\n\n"
+                                f"**상품명:** {row['상품명']}\n\n"
+                                f"**정제:** `{row['Target_Clean_Text']}`")
+                    with cb:
+                        code_val = str(row['상품코드']).strip()
+                        if code_val and code_val not in ('', 'nan', 'None'):
+                            emoji = "🟢" if row['판매상태'] == '판매중' else "🔴"
+                            st.write(f"**{emoji} 매칭 결과:**")
+                            st.success(f"**코드:** `{code_val}`\n\n"
+                                       f"**상품명:** {row['Matched_상품명']}\n\n"
+                                       f"**매칭텍스트:** `{row['Matched_Text']}`\n\n"
+                                       f"**상태:** {row['판매상태']}")
+                            st.caption(str(row['Clean_Version']))
+                        else:
+                            st.error("**❌ 미매칭**")
+        except Exception as e:
+            st.warning(f"상세 비교 표시 중 오류: {e}")
 
+        # 다운로드 — 항상 표시
         excel_data = io.BytesIO()
         with pd.ExcelWriter(excel_data, engine='xlsxwriter') as writer:
             df_output.to_excel(writer, index=False, sheet_name='Results')
